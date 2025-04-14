@@ -9,10 +9,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 import uuid
 
-import sys
-sys.path.append('.')  # Adjust as needed for your project structure
-
-from event_bus import (
+from core.event_bus import ( # <--- Changed this line
     EventBus, Event, EventPriority, EventTopics, PatternSubscription,
     create_event, create_market_data_event, create_order_event,
     create_system_event, create_strategy_event, create_regime_event,

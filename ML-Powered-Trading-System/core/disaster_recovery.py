@@ -23,7 +23,9 @@ import shutil
 import threading
 import time
 import uuid
-from dataclasses import dataclass, field, asdict
+import hashlib
+import traceback
+from dataclasses import dataclass, field, asdict, is_dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Callable, Tuple, Set, Union
@@ -36,11 +38,18 @@ from core.circuit_breaker import CircuitBreaker, CircuitState, CircuitType, Trig
 from config.disaster_recovery_config import DisasterRecoveryConfig, BackupStrategy, RecoveryMode
 from data.storage.persistent_queue import PersistentQueue
 from data.storage.time_series_store import TimeSeriesStore
-from data.storage.       market_snapshot import MarketSnapshotManager
+from data.storage.market_snapshot import MarketSnapshotManager
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
 
+
+class EnumEncoder(json.JSONEncoder):
+    """JSON encoder that handles Enum serialization."""
+    def default(self, obj):
+        if isinstance(obj, Enum):
+            return obj.value
+        return super().default(obj)
 
 class RecoveryState(Enum):
     """Recovery process states"""
@@ -336,38 +345,86 @@ class DisasterRecovery:
             self._snapshots = {}
 
     def _update_snapshot_index(self):
-        """Update the snapshot index on disk."""
+        """
+        Update the snapshot index JSON file on disk atomically.
+
+        Raises:
+            RuntimeError: If updating the index file fails for any reason.
+        """
+        logger.debug(f"Attempting to update snapshot index file: {self._snapshot_index_path}")
         try:
-            # Convert to serializable format
-            snapshots_data = [asdict(metadata) for metadata in self._snapshots.values()]
-            
-            # Sort by timestamp (newest first)
-            snapshots_data = sorted(snapshots_data, key=lambda s: s["timestamp"], reverse=True)
-            
-            # Limit number of snapshots in index
-            if len(snapshots_data) > self.config.max_snapshots_in_index:
-                snapshots_data = snapshots_data[:self.config.max_snapshots_in_index]
-            
-            # Update the index
+            # --- Create List of Dictionaries (with Enums as objects) ---
+            snapshots_list = []
+            for snapshot_id, metadata in self._snapshots.items():
+                try:
+                    # Convert dataclass to dict. Enums will still be Enum objects here.
+                    dict_repr = asdict(metadata)
+                    snapshots_list.append(dict_repr)  # Append the dict with Enum objects
+                except Exception as convert_err:
+                    # This error is less likely but possible if asdict fails
+                    logger.error(f"Failed to convert metadata to dict for snapshot {snapshot_id}: {convert_err}",
+                                 exc_info=True)
+                    raise RuntimeError(f"Dict conversion failed for snapshot {snapshot_id}") from convert_err
+
+            # --- Sort by Timestamp (Newest First) ---
+            # Sorting requires accessing the 'timestamp' key which exists in the dict
+            try:
+                snapshots_list = sorted(snapshots_list, key=lambda s: s["timestamp"], reverse=True)
+            except KeyError:
+                logger.error("Failed to sort snapshots - 'timestamp' key missing in one or more dicts.", exc_info=True)
+                # Depending on requirements, could raise, or try to proceed unsorted/filtered
+                raise RuntimeError("Snapshot sorting failed due to missing timestamp key")
+
+            # --- Limit Snapshots in Index ---
+            if len(snapshots_list) > self.config.max_snapshots_in_index:
+                logger.debug(
+                    f"Snapshot index count ({len(snapshots_list)}) exceeds limit ({self.config.max_snapshots_in_index}). Truncating.")
+                snapshots_list = snapshots_list[:self.config.max_snapshots_in_index]
+
+            # --- Prepare Final Index Data Structure ---
+            # The 'snapshots' list here contains dictionaries where Enum fields are still Enum objects
             index_data = {
                 "last_updated": time.time(),
                 "instance_id": self._instance_id,
-                "snapshots": snapshots_data
+                "snapshot_count": len(snapshots_list),
+                "snapshots": snapshots_list
             }
-            
-            # Write to temp file first
-            temp_path = self._snapshot_index_path.with_suffix(".tmp")
-            with open(temp_path, 'w') as f:
-                json.dump(index_data, f, indent=2)
-            
-            # Rename for atomic update
-            temp_path.replace(self._snapshot_index_path)
-            
-            logger.debug(f"Updated snapshot index with {len(snapshots_data)} entries")
-            
-        except Exception as e:
-            logger.error(f"Failed to update snapshot index: {e}", exc_info=True)
 
+            # --- Atomic Write using Temp File ---
+            temp_path = self._snapshot_index_path.with_suffix(".tmp")
+            logger.debug(f"Writing updated index to temporary file: {temp_path}")
+            try:
+                with open(temp_path, 'w') as f:
+                    # Use the EnumEncoder HERE during the final dump to handle Enum objects
+                    json.dump(index_data, f, indent=2, cls=EnumEncoder)
+                logger.debug(f"Successfully wrote temporary index file.")
+            except Exception as write_err:
+                logger.error(f"Failed to write temporary index file {temp_path}: {write_err}", exc_info=True)
+                if temp_path.exists():
+                    try:
+                        temp_path.unlink()
+                    except OSError:
+                        pass
+                raise RuntimeError("Failed writing temporary snapshot index") from write_err
+
+            # --- Atomically Replace Old Index ---
+            try:
+                logger.debug(f"Atomically replacing '{self._snapshot_index_path}' with '{temp_path}'")
+                temp_path.replace(self._snapshot_index_path)
+                logger.info(
+                    f"Successfully updated snapshot index file '{self._snapshot_index_path}' with {len(snapshots_list)} entries.")
+            except Exception as replace_err:
+                logger.error(f"Failed to atomically replace snapshot index file from {temp_path}: {replace_err}",
+                             exc_info=True)
+                raise RuntimeError("Failed replacing snapshot index file atomically") from replace_err
+
+        except Exception as e:
+            # Catch any unexpected error during the process
+            logger.error(f"CRITICAL FAILURE during snapshot index update: {e}\n{traceback.format_exc()}")
+            if isinstance(e, RuntimeError):
+                raise e
+            else:
+                raise RuntimeError(f"Failed to update snapshot index: {e}") from e
     def register_verification_rule(self, rule: Callable[[], Tuple[bool, str]]):
         """
         Register a verification rule for system state validation.
@@ -389,40 +446,46 @@ class DisasterRecovery:
         self._component_verifiers[component_id] = verifier
         logger.debug(f"Registered component verifier for {component_id}")
 
-    def create_snapshot(self, trigger: RecoveryTrigger = RecoveryTrigger.MANUAL, metadata: Dict[str, Any] = None) -> str:
+    def create_snapshot(self, trigger: RecoveryTrigger = RecoveryTrigger.MANUAL,
+                        metadata: Dict[str, Any] = None) -> str:
         """
         Create a system snapshot for disaster recovery.
-        
+
         Args:
             trigger: What triggered this snapshot
             metadata: Additional metadata to store with the snapshot
-            
+
         Returns:
             Snapshot ID
         """
+        snapshot_id: Optional[str] = None  # Initialize to None
+        snapshot_dir: Optional[Path] = None  # Initialize to None
+        snapshot_metadata: Optional[SnapshotMetadata] = None  # Initialize to None
+
         with self._snapshot_lock:
             # Generate snapshot ID
             timestamp = time.time()
             snapshot_id = f"snapshot_{int(timestamp)}_{uuid.uuid4().hex[:8]}"
-            
+
             # Create snapshot directory
             snapshot_dir = self._snapshot_dir / snapshot_id
             snapshot_dir.mkdir(parents=True, exist_ok=True)
-            
+
             # Initialize metadata
             snapshot_metadata = SnapshotMetadata(
                 id=snapshot_id,
                 timestamp=timestamp,
                 trigger=trigger,
                 state_hash="",  # Will be filled after state capture
-                size_bytes=0,   # Will be updated after files are written
-                custom_metadata=metadata or {}
+                size_bytes=0,  # Will be updated after files are written
+                custom_metadata=metadata or {},
+                is_complete=False  # Start as incomplete
             )
-            
+
             try:
-                # Update recovery state
-                self._recovery_state = RecoveryState.SNAPSHOT_CREATION
-                
+                # Update recovery state (optional, might be too granular here)
+                # self._recovery_state = RecoveryState.SNAPSHOT_CREATION
+
                 # Notify about snapshot start
                 self.event_bus.publish(Event(
                     topic="disaster_recovery.snapshot_started",
@@ -434,84 +497,92 @@ class DisasterRecovery:
                     priority=EventPriority.NORMAL,
                     source="disaster_recovery"
                 ))
-                
+
                 logger.info(f"Creating system snapshot: {snapshot_id}, trigger: {trigger.value}")
-                
-                # Capture system state (using transaction to ensure consistency)
+
+                # --- 1. Capture System State ---
+                state_snapshot = {}  # Initialize empty
+                state_hash = ""
                 with self.state_manager.begin_transaction() as txn:
                     # Create a backup of the current state
-                    state_snapshot = self.state_manager.create_snapshot()
-                    
+                    state_snapshot = self.state_manager.create_snapshot()  # type: ignore
+
                     # Write state to snapshot directory
                     state_path = snapshot_dir / "system_state.json"
                     with open(state_path, 'w') as f:
-                        json.dump(state_snapshot, f, indent=2)
-                    
+                        json.dump(state_snapshot, f, indent=2, cls=EnumEncoder)
+
                     # Calculate state hash for integrity verification
-                    import hashlib
-                    state_hash = hashlib.sha256(json.dumps(state_snapshot, sort_keys=True).encode()).hexdigest()
+                    # Ensure consistent serialization for hashing
+                    state_json_str = json.dumps(state_snapshot, sort_keys=True, cls=EnumEncoder)
+                    state_hash = hashlib.sha256(state_json_str.encode()).hexdigest()
                     snapshot_metadata.state_hash = state_hash
-                    
+
                     # Update component status
                     snapshot_metadata.component_status["state_manager"] = "completed"
-                
-                # Collect snapshots from other components
-                component_snapshots = self._collect_component_snapshots()
-                
-                # Write component snapshots to disk
-                for component_id, component_data in component_snapshots.items():
-                    component_file = snapshot_dir / f"{component_id}.json"
-                    with open(component_file, 'w') as f:
-                        json.dump(component_data, f, indent=2)
-                    
-                    # Update component status
-                    snapshot_metadata.component_status[component_id] = "completed"
-                
-                # Backup transaction journal
-                journal_path = snapshot_dir / "transaction_journal.bin"
-                self._backup_transaction_journal(journal_path)
-                
-                # Create market data snapshot if available
+
+                # --- 2. Collect Component Snapshots (Example - Adapt if needed) ---
                 try:
-                    from data.market_snapshot import create_snapshot
-                    market_snapshot = create_snapshot()
-                    if market_snapshot:
-                        market_file = snapshot_dir / "market_snapshot.json"
-                        with open(market_file, 'w') as f:
-                            json.dump(market_snapshot, f, indent=2)
-                        snapshot_metadata.component_status["market_data"] = "completed"
-                except (ImportError, Exception) as e:
-                    logger.warning(f"Failed to create market snapshot: {e}")
-                    snapshot_metadata.component_status["market_data"] = "failed"
-                
-                # Create model snapshots if configured
+                    component_snapshots = self._collect_component_snapshots()
+                    for component_id, data in component_snapshots.items():
+                        comp_path = snapshot_dir / f"{component_id}.json"
+                        with open(comp_path, 'w') as f:
+                            json.dump(data, f, indent=2, cls=EnumEncoder)
+                        snapshot_metadata.component_status[component_id] = "completed"
+                        logger.debug(f"Saved snapshot for component {component_id}")
+                except Exception as comp_err:
+                    logger.warning(f"Could not collect all component snapshots for {snapshot_id}: {comp_err}",
+                                   exc_info=True)
+                    # Decide if this is fatal or just a warning based on requirements
+                    # snapshot_metadata.component_status["components"] = "incomplete"
+
+                # --- 3. Backup Transaction Journal (Example - Adapt if needed) ---
+                try:
+                    journal_path = snapshot_dir / "transaction_journal.bin"
+                    self._backup_transaction_journal(journal_path)
+                    snapshot_metadata.component_status["transaction_journal"] = "completed"
+                    logger.debug(f"Backed up transaction journal for {snapshot_id}")
+                except Exception as journal_err:
+                    logger.warning(f"Could not backup transaction journal for {snapshot_id}: {journal_err}",
+                                   exc_info=True)
+                    snapshot_metadata.component_status["transaction_journal"] = "failed"
+
+                # --- 4. Backup Models (Example - Adapt if needed) ---
                 if self.config.include_models_in_snapshot:
-                    model_dir = snapshot_dir / "models"
-                    model_dir.mkdir(exist_ok=True)
                     try:
-                        self._backup_models(model_dir)
+                        model_backup_dir = snapshot_dir / "models"
+                        self._backup_models(model_backup_dir)
                         snapshot_metadata.component_status["models"] = "completed"
-                    except Exception as e:
-                        logger.error(f"Failed to backup models: {e}")
+                        logger.debug(f"Backed up models for {snapshot_id}")
+                    except Exception as model_err:
+                        logger.warning(f"Could not backup models for {snapshot_id}: {model_err}", exc_info=True)
                         snapshot_metadata.component_status["models"] = "failed"
-                
-                # Calculate total size
-                total_size = sum(f.stat().st_size for f in snapshot_dir.glob('**/*') if f.is_file())
-                snapshot_metadata.size_bytes = total_size
-                
-                # Mark snapshot as complete
+
+                # --- 5. Write Initial Metadata File ---
+                # Mark as complete *before* calculating size, size will be updated
                 snapshot_metadata.is_complete = True
-                
-                # Save snapshot metadata
                 metadata_path = snapshot_dir / "metadata.json"
                 with open(metadata_path, 'w') as f:
-                    json.dump(asdict(snapshot_metadata), f, indent=2)
-                
-                # Update snapshots dictionary and index
+                    json.dump(asdict(snapshot_metadata), f, indent=2, cls=EnumEncoder)
+                logger.debug(f"Wrote initial metadata for {snapshot_id}")
+
+                # --- 6. Calculate Final Size ---
+                total_size = sum(f.stat().st_size for f in snapshot_dir.glob('**/*') if f.is_file())
+                snapshot_metadata.size_bytes = total_size
+                logger.debug(f"Calculated final size for {snapshot_id}: {total_size} bytes")
+
+                # --- 7. Update Metadata File with Final Size ---
+                # Re-write metadata file to include the final size
+                with open(metadata_path, 'w') as f:
+                    json.dump(asdict(snapshot_metadata), f, indent=2, cls=EnumEncoder)
+                logger.debug(f"Updated metadata with final size for {snapshot_id}")
+
+                # --- 8. Finalize and Notify ---
+                # Update in-memory index and save index file
                 self._snapshots[snapshot_id] = snapshot_metadata
                 self._update_snapshot_index()
                 self._last_snapshot_time = timestamp
-                
+
                 # Publish snapshot completed event
                 self.event_bus.publish(Event(
                     topic="disaster_recovery.snapshot_completed",
@@ -519,53 +590,70 @@ class DisasterRecovery:
                         "snapshot_id": snapshot_id,
                         "trigger": trigger.value,
                         "timestamp": timestamp,
-                        "size_bytes": total_size
+                        "size_bytes": snapshot_metadata.size_bytes
                     },
                     priority=EventPriority.NORMAL,
                     source="disaster_recovery"
                 ))
-                
-                logger.info(f"Snapshot {snapshot_id} created successfully ({total_size / (1024*1024):.2f} MB)")
-                
-                # Reset recovery state
-                self._recovery_state = RecoveryState.IDLE
-                
+
+                logger.info(
+                    f"Snapshot {snapshot_id} created successfully ({snapshot_metadata.size_bytes / (1024 * 1024):.2f} MB)")
+
+                # Reset recovery state if it was being tracked
+                if self._recovery_state == RecoveryState.SNAPSHOT_CREATION:
+                    self._recovery_state = RecoveryState.IDLE
+
                 # Replicate to remote regions if configured
-                if (self.config.multi_region_enabled and 
-                    self.config.auto_replicate and 
-                    trigger != RecoveryTrigger.SCHEDULED):  # Don't replicate scheduled snapshots automatically
-                    self.replicate_snapshot(snapshot_id)
-                
+                if (self.config.multi_region_enabled and
+                        self.config.auto_replicate and
+                        trigger != RecoveryTrigger.SCHEDULED):  # Don't replicate scheduled snapshots automatically
+                    try:
+                        self.replicate_snapshot(snapshot_id)
+                    except Exception as repl_err:
+                        logger.error(f"Failed to automatically replicate snapshot {snapshot_id}: {repl_err}",
+                                     exc_info=True)
+
                 return snapshot_id
-                
+
             except Exception as e:
                 logger.error(f"Failed to create snapshot {snapshot_id}: {e}", exc_info=True)
-                
-                # Update metadata to indicate failure
-                failed_metadata_path = snapshot_dir / "failed_metadata.json"
-                try:
+
+                # Update metadata to indicate failure if metadata object exists
+                if snapshot_metadata:
                     snapshot_metadata.is_complete = False
-                    with open(failed_metadata_path, 'w') as f:
-                        json.dump(asdict(snapshot_metadata), f, indent=2)
-                except:
-                    pass
-                
+
+                    # Attempt to save failed metadata (best effort) if snapshot_dir exists
+                    if snapshot_dir and snapshot_dir.exists():
+                        failed_metadata_path = snapshot_dir / "failed_metadata.json"
+                        try:
+                            with open(failed_metadata_path, 'w') as f:
+                                json.dump(asdict(snapshot_metadata), f, indent=2, cls=EnumEncoder)
+                            logger.info(f"Wrote failed metadata file for {snapshot_id}")
+                        except Exception as meta_err:
+                            logger.error(
+                                f"Additionally failed to write failed_metadata.json for {snapshot_id}: {meta_err}")
+
                 # Publish snapshot failed event
-                self.event_bus.publish(Event(
-                    topic="disaster_recovery.snapshot_failed",
-                    data={
-                        "snapshot_id": snapshot_id,
-                        "trigger": trigger.value,
-                        "timestamp": timestamp,
-                        "error": str(e)
-                    },
-                    priority=EventPriority.HIGH,
-                    source="disaster_recovery"
-                ))
-                
-                # Reset recovery state
-                self._recovery_state = RecoveryState.IDLE
-                
+                if snapshot_id:  # Only publish if we got far enough to have an ID
+                    self.event_bus.publish(Event(
+                        topic="disaster_recovery.snapshot_failed",
+                        data={
+                            "snapshot_id": snapshot_id,
+                            "trigger": trigger.value,
+                            "timestamp": timestamp,  # Use the timestamp from the start
+                            "error": str(e)
+                        },
+                        priority=EventPriority.HIGH,
+                        source="disaster_recovery"
+                    ))
+
+                # Reset recovery state if it was being tracked
+                if self._recovery_state == RecoveryState.SNAPSHOT_CREATION:
+                    self._recovery_state = RecoveryState.IDLE
+
+                # Re-raise the exception to signal failure upstream if needed,
+                # or decide based on architecture if failure should be silent
+                # beyond the event publication. Re-raising is often clearer.
                 raise
 
     def _collect_component_snapshots(self) -> Dict[str, Any]:
@@ -745,10 +833,10 @@ class DisasterRecovery:
     def get_snapshot_info(self, snapshot_id: str) -> Optional[Dict[str, Any]]:
         """
         Get information about a specific snapshot.
-        
+
         Args:
             snapshot_id: ID of the snapshot
-            
+
         Returns:
             Snapshot information dictionary or None if not found
         """
@@ -756,15 +844,20 @@ class DisasterRecovery:
             snapshot = self._snapshots.get(snapshot_id)
             if not snapshot:
                 return None
-            
+
             # Create a human-readable timestamp
             dt = datetime.datetime.fromtimestamp(snapshot.timestamp)
             formatted_time = dt.strftime("%Y-%m-%d %H:%M:%S")
-            
+
             # Add snapshot info
             snapshot_dict = asdict(snapshot)
+
+            # Convert Enum to string value if needed
+            if isinstance(snapshot_dict['trigger'], Enum):
+                snapshot_dict['trigger'] = snapshot_dict['trigger'].value
+
             snapshot_dict["formatted_time"] = formatted_time
-            
+
             # Get file existence information
             snapshot_dir = self._snapshot_dir / snapshot_id
             if snapshot_dir.exists():
@@ -777,12 +870,12 @@ class DisasterRecovery:
                     "models": (snapshot_dir / "models").exists()
                 }
                 snapshot_dict["files"] = files
-                
+
                 # Calculate total size if not already set
                 if snapshot.size_bytes == 0:
                     total_size = sum(f.stat().st_size for f in snapshot_dir.glob('**/*') if f.is_file())
                     snapshot_dict["size_bytes"] = total_size
-            
+
             return snapshot_dict
 
     def verify_snapshot(self, snapshot_id: str) -> Tuple[bool, Dict[str, Any]]:
@@ -1110,212 +1203,219 @@ class DisasterRecovery:
             )
         
         return all_valid, failures
-    
+
     def recover_from_snapshot(
-        self, 
-        snapshot_id: Optional[str] = None,
-        verify_after_recovery: bool = True,
-        metadata: Optional[Dict[str, Any]] = None
+            self,
+            snapshot_id: Optional[str] = None,
+            verify_after_recovery: bool = True,
+            metadata: Optional[Dict[str, Any]] = None
     ) -> bool:
-        """
-        Recover the system from a snapshot.
-        
-        Args:
-            snapshot_id: ID of the snapshot to recover from, or None for latest
-            verify_after_recovery: Whether to verify system state after recovery
-            metadata: Additional metadata for the recovery event
-            
-        Returns:
-            True if recovery was successful, False otherwise
-        """
-        # Prevent multiple simultaneous recoveries
+
         if self._recovery_in_progress.is_set():
             logger.warning("Recovery already in progress, ignoring new request")
             return False
-        
+
+        recovery_event: Optional[RecoveryEvent] = None
+        snapshot_dir: Optional[Path] = None
+        start_time: Optional[float] = None  # Initialize start_time
+
+        # --- Outer Try/Finally for setting/clearing progress flag ---
         try:
-            # Set recovery in progress flag
             self._recovery_in_progress.set()
-            
-            # Find snapshot to recover from
+
+            # --- Find Snapshot ---
             if snapshot_id is None:
-                # Use the latest snapshot
                 if not self._snapshots:
                     logger.error("No snapshots available for recovery")
-                    return False
-                
+                    return False  # No need for finally block cleanup if we haven't started
                 snapshot = max(self._snapshots.values(), key=lambda s: s.timestamp)
                 snapshot_id = snapshot.id
                 logger.info(f"Using latest snapshot for recovery: {snapshot_id}")
             else:
-                # Find the specified snapshot
                 snapshot = self._snapshots.get(snapshot_id)
                 if not snapshot:
                     logger.error(f"Snapshot {snapshot_id} not found")
-                    return False
-            
-            # Create recovery event
+                    return False  # No need for finally block cleanup yet
+            # --- Snapshot Found ---
+
+            # --- Create Recovery Event and Set Initial State ---
             recovery_event = RecoveryEvent(
-                trigger=RecoveryTrigger.MANUAL,
+                trigger=RecoveryTrigger.MANUAL,  # Assuming manual unless specified otherwise
                 state=RecoveryState.PREPARING,
                 snapshot_id=snapshot_id,
                 target_instance=self._instance_id,
                 metadata=metadata or {}
             )
             self._current_recovery = recovery_event
-            
-            # Update recovery state
             self._recovery_state = RecoveryState.PREPARING
-            
-            # Notify about recovery start
+            logger.info(f"Recovery process starting for snapshot {snapshot_id}. State: {self._recovery_state.value}")
+
             self.event_bus.publish(Event(
                 topic="disaster_recovery.recovery_started",
-                data=asdict(recovery_event),
-                priority=EventPriority.HIGH,
-                source="disaster_recovery"
+                data=_prepare_event_data(recovery_event),
+                priority=EventPriority.HIGH, source="disaster_recovery"
             ))
-            
-            # Verify snapshot integrity first
+
+            # --- Verify Snapshot ---
             logger.info(f"Verifying snapshot {snapshot_id} before recovery")
             self._recovery_state = RecoveryState.STATE_VERIFICATION
+            recovery_event.state = self._recovery_state
             is_valid, verification_details = self.verify_snapshot(snapshot_id)
-            
+
             if not is_valid:
-                logger.error(f"Snapshot {snapshot_id} verification failed, aborting recovery")
+                error_msg = f"Snapshot {snapshot_id} verification failed. Details: {verification_details}"
+                logger.error(error_msg)
                 recovery_event.state = RecoveryState.FAILED
                 recovery_event.error_message = "Snapshot verification failed"
                 self._recovery_state = RecoveryState.FAILED
-                return False
-            
-            logger.info(f"Snapshot {snapshot_id} verified, proceeding with recovery")
-            
-            # Load snapshot data
+                self.event_bus.publish(Event(
+                    topic="disaster_recovery.recovery_failed",
+                    data=_prepare_event_data(recovery_event),
+                    priority=EventPriority.HIGH, source="disaster_recovery"
+                ))
+                return False  # Cleanup happens in the finally block
+
+            logger.info(f"Snapshot {snapshot_id} verified.")
+
+            # --- Check Snapshot Directory ---
             snapshot_dir = self._snapshot_dir / snapshot_id
-            if not snapshot_dir.exists():
-                logger.error(f"Snapshot directory {snapshot_id} not found")
+            if not snapshot_dir.is_dir():
+                error_msg = f"Snapshot directory path invalid: {snapshot_dir}"
+                logger.error(error_msg)
                 recovery_event.state = RecoveryState.FAILED
-                recovery_event.error_message = "Snapshot directory not found"
+                recovery_event.error_message = "Snapshot directory path is invalid"
                 self._recovery_state = RecoveryState.FAILED
-                return False
-            
+                self.event_bus.publish(Event(
+                    topic="disaster_recovery.recovery_failed",
+                    data=_prepare_event_data(recovery_event),
+                    priority=EventPriority.HIGH, source="disaster_recovery"
+                ))
+                return False  # Cleanup happens in the finally block
+
+            # --- Start Timer and Main Recovery Logic ---
             start_time = time.time()
-            
+            recovery_event.timestamp = start_time
+
+            # --- THIS IS THE TRY BLOCK THAT WAS LIKELY BROKEN ---
             try:
-                # First create a backup of current state before recovery (for rollback if needed)
+                # --- Create Pre-Recovery Snapshot ---
+                logger.info("Creating pre-recovery backup snapshot...")
                 pre_recovery_snapshot_id = self.create_snapshot(
-                    trigger=RecoveryTrigger.MANUAL,
+                    trigger=RecoveryTrigger.AUTOMATIC,
                     metadata={"purpose": "pre_recovery", "recovery_id": recovery_event.id}
                 )
                 recovery_event.metadata["pre_recovery_snapshot_id"] = pre_recovery_snapshot_id
                 logger.info(f"Created pre-recovery snapshot: {pre_recovery_snapshot_id}")
-                
-                # Restore system state
+
+                # --- Restore System State ---
                 self._recovery_state = RecoveryState.STATE_RESTORATION
+                recovery_event.state = self._recovery_state
                 state_path = snapshot_dir / "system_state.json"
-                
+                if not state_path.is_file():
+                    raise FileNotFoundError(f"System state file not found: {state_path}")
                 with open(state_path, 'r') as f:
                     state_data = json.load(f)
-                
-                logger.info("Restoring system state from snapshot")
-                
-                # Use transaction to ensure consistency
-                with self.state_manager.begin_transaction() as txn:
-                    self.state_manager.restore_snapshot(state_data)
-                
+                logger.info("Restoring system state from snapshot via transaction...")
+                with self.state_manager.begin_transaction() as txn:  # type: ignore
+                    self.state_manager.restore_snapshot(state_data)  # type: ignore
+                logger.info("System state restored.")
                 recovery_event.components_recovered.append("state_manager")
-                
-                # Replay transaction journal if available
+
+                # --- Replay Journal ---
                 journal_path = snapshot_dir / "transaction_journal.bin"
-                if journal_path.exists():
+                if journal_path.is_file():
+                    logger.info("Replaying transaction journal...")
                     self._recovery_state = RecoveryState.JOURNAL_REPLAY
+                    recovery_event.state = self._recovery_state
                     self._replay_transaction_journal(journal_path)
                     recovery_event.components_recovered.append("transaction_journal")
-                
-                # Restore market snapshot if available
-                market_path = snapshot_dir / "market_snapshot.json"
-                if market_path.exists():
-                    try:
-                        with open(market_path, 'r') as f:
-                            market_data = json.load(f)
-                        
-                        # Try to restore market snapshot
-                        from data.market_snapshot import restore_snapshot
-                        if restore_snapshot(market_data):
-                            recovery_event.components_recovered.append("market_data")
-                    except (ImportError, Exception) as e:
-                        logger.warning(f"Failed to restore market snapshot: {e}")
-                
-                # Restore models if available and configured
+                    logger.info("Transaction journal replay completed.")
+                else:
+                    logger.info("No transaction journal found, skipping replay.")
+
+                # --- Restore Models (Optional) ---
                 if self.config.include_models_in_recovery:
                     model_dir = snapshot_dir / "models"
-                    if model_dir.exists():
+                    if model_dir.is_dir():
+                        logger.info("Restoring models...")
                         try:
                             self._restore_models(model_dir)
                             recovery_event.components_recovered.append("models")
-                        except Exception as e:
-                            logger.error(f"Failed to restore models: {e}")
-                
-                # Restore component data
+                            logger.info("Models restored.")
+                        except Exception as model_err:
+                            logger.error(f"Failed to restore models: {model_err}", exc_info=True)
+                            recovery_event.metadata["model_restore_error"] = str(model_err)
+
+                # --- Recover Components ---
+                logger.info("Initiating component-specific recovery...")
                 self._recovery_state = RecoveryState.COMPONENT_RECOVERY
+                recovery_event.state = self._recovery_state
                 component_recoveries = self._recover_components(snapshot_dir)
                 recovery_event.components_recovered.extend(component_recoveries)
-                
-                # Verify system state after recovery if requested
+                logger.info(f"Component recovery completed for: {component_recoveries}")
+
+                # --- Post-Recovery Verification ---
                 if verify_after_recovery:
+                    logger.info("Verifying system state after recovery...")
                     self._recovery_state = RecoveryState.STATE_VERIFICATION
-                    is_valid, failures = self.verify_system_state()
-                    
-                    if not is_valid:
-                        logger.warning(f"System state verification after recovery identified issues: {len(failures)} failures")
-                        recovery_event.metadata["verification_failures"] = failures
+                    recovery_event.state = self._recovery_state
+                    is_valid_after, failures_after = self.verify_system_state()
+                    if not is_valid_after:
+                        logger.warning(
+                            f"Post-recovery verification failed: {len(failures_after)} issues. Details: {failures_after}")
+                        recovery_event.metadata["post_recovery_verification_failures"] = failures_after
                     else:
-                        logger.info("System state verification after recovery successful")
-                        recovery_event.metadata["verification"] = "passed"
-                
-                # Calculate recovery duration
+                        logger.info("Post-recovery verification successful.")
+                        recovery_event.metadata["post_recovery_verification"] = "passed"
+                else:
+                    logger.info("Skipping post-recovery verification.")
+
+                # --- Success Case ---
                 recovery_duration = time.time() - start_time
                 recovery_event.duration_seconds = recovery_duration
-                
-                # Update recovery state
                 self._recovery_state = RecoveryState.COMPLETED
-                recovery_event.state = RecoveryState.COMPLETED
+                recovery_event.state = self._recovery_state
                 recovery_event.success = True
-                
-                # Notify about recovery completion
                 self.event_bus.publish(Event(
                     topic="disaster_recovery.recovery_completed",
-                    data=asdict(recovery_event),
-                    priority=EventPriority.HIGH,
-                    source="disaster_recovery"
+                    data=_prepare_event_data(recovery_event),
+                    priority=EventPriority.HIGH, source="disaster_recovery"
                 ))
-                
-                logger.info(f"Recovery from snapshot {snapshot_id} completed successfully in {recovery_duration:.2f} seconds")
-                
+                logger.info(f"Recovery from snapshot {snapshot_id} succeeded in {recovery_duration:.2f}s.")
                 return True
-                
+
+            # --- THIS IS THE CORRESPONDING EXCEPT BLOCK ---
             except Exception as e:
-                logger.error(f"Error during recovery from snapshot {snapshot_id}: {e}", exc_info=True)
-                
-                recovery_event.state = RecoveryState.FAILED
-                recovery_event.error_message = str(e)
-                recovery_event.success = False
-                
-                # Notify about recovery failure
-                self.event_bus.publish(Event(
-                    topic="disaster_recovery.recovery_failed",
-                    data=asdict(recovery_event),
-                    priority=EventPriority.HIGH,
-                    source="disaster_recovery"
-                ))
-                
+                # --- Recovery Failed During Execution ---
+                logger.error(f"Error during recovery execution from snapshot {snapshot_id}: {e}", exc_info=True)
+                # Update event and internal state
+                if recovery_event:
+                    recovery_event.state = RecoveryState.FAILED
+                    recovery_event.error_message = str(e)
+                    recovery_event.success = False
+                    if start_time:
+                        recovery_event.duration_seconds = time.time() - start_time
                 self._recovery_state = RecoveryState.FAILED
-                return False
-                
+                # Publish failure event
+                if recovery_event:
+                    self.event_bus.publish(Event(
+                        topic="disaster_recovery.recovery_failed",
+                        data=_prepare_event_data(recovery_event),
+                        priority=EventPriority.HIGH, source="disaster_recovery"
+                    ))
+                return False  # Indicate failure, cleanup happens in finally
+
+        # --- THIS IS THE FINALLY BLOCK FOR THE OUTER TRY ---
         finally:
-            # Clear recovery in progress flag
+            # Always clear the progress flag and current recovery info
+            logger.debug("Executing recovery finally block: Clearing progress flag.")
             self._recovery_in_progress.clear()
             self._current_recovery = None
-    
+            # Optionally reset state if it's stuck in an intermediate state
+            if self._recovery_state not in [RecoveryState.COMPLETED, RecoveryState.FAILED, RecoveryState.IDLE]:
+                logger.warning(f"Recovery ended in intermediate state {self._recovery_state}. Resetting to IDLE.")
+                self._recovery_state = RecoveryState.IDLE
+
     def _replay_transaction_journal(self, journal_path: Path):
         """
         Replay transaction journal from a snapshot.
@@ -1539,87 +1639,193 @@ class DisasterRecovery:
         with self._replication_lock:
             # Return a copy to avoid external modification
             return {region_id: dict(info) for region_id, info in self._remote_regions.items()}
-    
+
+
     def recover_from_remote_region(self, region_id: str, snapshot_id: Optional[str] = None) -> bool:
         """
-        Recover system state from a snapshot in a remote region.
-        
+        Recover system state from a snapshot located in a remote region's replication storage.
+
+        This method first copies the snapshot data to the local snapshot directory,
+        loads its metadata into the local index, and then triggers the standard
+        `recover_from_snapshot` process using the locally prepared snapshot.
+
         Args:
-            region_id: ID of the remote region
-            snapshot_id: ID of the snapshot to recover from, or None for latest
-            
+            region_id: The identifier string of the remote region.
+            snapshot_id: The specific ID of the snapshot to recover from. If None,
+                         the chronologically latest snapshot found in the remote
+                         region's directory will be used.
+
         Returns:
-            True if recovery was successful, False otherwise
+            True if the entire process (copy, index, recover) was successful,
+            False otherwise.
         """
+        logger.info(
+            f"Starting recovery attempt from remote region '{region_id}', snapshot: '{snapshot_id or 'latest'}'")
+
         if not self.config.multi_region_enabled:
-            logger.warning("Multi-region recovery is not enabled")
+            logger.warning("Multi-region recovery initiated but multi_region_enabled is False in config.")
             return False
-        
+
+        # --- Validate Region and Find Source Snapshot Directory ---
+        # Use replication lock primarily for accessing remote region info/paths safely
         with self._replication_lock:
-            # Check if region exists
             if region_id not in self._remote_regions:
-                logger.error(f"Remote region {region_id} not found")
+                logger.error(f"Remote region '{region_id}' not found in configured remote_regions.")
                 return False
-            
+
             region_dir = self._replicated_dir / region_id
-            if not region_dir.exists():
-                logger.error(f"Remote region directory {region_id} not found")
+            if not region_dir.is_dir():
+                logger.error(f"Remote region replication directory not found or is not a directory: {region_dir}")
                 return False
-            
-            # Find snapshot to recover from
+
+            source_snapshot_dir: Optional[Path] = None
             if snapshot_id is None:
-                # Find the latest snapshot in the region
-                snapshot_dirs = list(region_dir.glob("snapshot_*"))
-                if not snapshot_dirs:
-                    logger.error(f"No snapshots found in region {region_id}")
+                # Find the latest snapshot directory in the region based on name sorting
+                logger.debug(f"No specific snapshot ID provided, searching for latest in {region_dir}")
+                try:
+                    # Ensure we only consider directories matching the snapshot pattern
+                    potential_dirs = [d for d in region_dir.glob("snapshot_*") if d.is_dir()]
+                    if not potential_dirs:
+                        logger.error(f"No snapshot directories found matching 'snapshot_*' in {region_dir}")
+                        return False
+                    # Sort by name (snapshot_TIMESTAMP_UUID), newest first
+                    latest_dir = sorted(potential_dirs, key=lambda d: d.name, reverse=True)[0]
+                    snapshot_id = latest_dir.name  # Assign the determined snapshot ID
+                    source_snapshot_dir = latest_dir
+                    logger.info(f"Determined latest snapshot in region '{region_id}' to be: {snapshot_id}")
+                except Exception as e:
+                    logger.error(f"Error finding latest snapshot directory in {region_dir}: {e}", exc_info=True)
                     return False
-                
-                # Sort by name (which includes timestamp)
-                latest_dir = sorted(snapshot_dirs, key=lambda d: d.name, reverse=True)[0]
-                snapshot_id = latest_dir.name
-                logger.info(f"Using latest snapshot from region {region_id}: {snapshot_id}")
             else:
-                # Check if the specified snapshot exists
-                snapshot_dir = region_dir / snapshot_id
-                if not snapshot_dir.exists():
-                    logger.error(f"Snapshot {snapshot_id} not found in region {region_id}")
+                # Use the provided snapshot ID
+                potential_dir = region_dir / snapshot_id
+                if not potential_dir.is_dir():
+                    logger.error(
+                        f"Specified snapshot directory '{snapshot_id}' not found or not a directory in {region_dir}")
                     return False
-            
-            # Copy the snapshot to local snapshots directory
-            source_dir = region_dir / snapshot_id
-            dest_dir = self._snapshot_dir / snapshot_id
-            
+                source_snapshot_dir = potential_dir
+                logger.debug(f"Using specified snapshot '{snapshot_id}' from region '{region_id}'")
+
+            if not source_snapshot_dir or not snapshot_id:
+                logger.error("Failed to determine a valid source snapshot directory or ID.")
+                return False  # Should not happen if logic above is correct, but safeguard
+
+        # --- Prepare Local Snapshot Directory ---
+        local_snapshot_dir = self._snapshot_dir / snapshot_id
+        metadata_loaded_successfully = False
+        local_snapshot_metadata: Optional[SnapshotMetadata] = None
+
+        try:
+            # --- Copy Snapshot Data Locally ---
+            logger.info(f"Preparing local snapshot: Copying from '{source_snapshot_dir}' to '{local_snapshot_dir}'")
+            if local_snapshot_dir.exists():
+                logger.warning(
+                    f"Local snapshot directory '{local_snapshot_dir}' already exists. Removing it before copy.")
+                shutil.rmtree(local_snapshot_dir)
+
+            shutil.copytree(source_snapshot_dir, local_snapshot_dir)
+            logger.info(f"Successfully copied snapshot '{snapshot_id}' to local directory.")
+
+            # --- Load and Validate Metadata from Local Copy ---
+            local_metadata_path = local_snapshot_dir / "metadata.json"
+            if not local_metadata_path.is_file():
+                logger.error(f"Copied snapshot '{snapshot_id}' is missing metadata file at '{local_metadata_path}'")
+                raise FileNotFoundError("Metadata file missing after copy")  # Raise to trigger cleanup
+
+            logger.debug(f"Loading metadata from local file: '{local_metadata_path}'")
+            with open(local_metadata_path, 'r') as f:
+                metadata_dict = json.load(f)
+            logger.debug(f"Raw metadata dictionary loaded: {metadata_dict}")
+
+            # Basic validation of loaded metadata
+            if metadata_dict.get("id") != snapshot_id:
+                logger.error(
+                    f"Metadata integrity check failed: ID in file ('{metadata_dict.get('id')}') does not match expected snapshot ID ('{snapshot_id}')")
+                raise ValueError("Snapshot ID mismatch in metadata file")  # Raise to trigger cleanup
+
+            # --- Deserialize Metadata into Dataclass Object ---
+            logger.debug("Attempting to deserialize loaded metadata into SnapshotMetadata object.")
             try:
-                if dest_dir.exists():
-                    shutil.rmtree(dest_dir)
-                
-                # Copy the snapshot
-                shutil.copytree(source_dir, dest_dir)
-                
-                # Load snapshot metadata
-                metadata_path = dest_dir / "metadata.json"
-                if metadata_path.exists():
-                    with open(metadata_path, 'r') as f:
-                        metadata = json.load(f)
-                    
-                    # Create snapshot metadata object
-                    snapshot_metadata = SnapshotMetadata(**metadata)
-                    
-                    # Add to snapshots dictionary
-                    self._snapshots[snapshot_id] = snapshot_metadata
-                    self._update_snapshot_index()
-                
-                # Now recover from the copied snapshot
-                return self.recover_from_snapshot(
+                # Create a copy to avoid modifying the original loaded dict if needed elsewhere
+                metadata_copy = metadata_dict.copy()
+
+                # Handle Enum deserialization (e.g., trigger) if stored as string
+                trigger_value = metadata_copy.get('trigger')
+                if isinstance(trigger_value, str):
+                    try:
+                        metadata_copy['trigger'] = RecoveryTrigger(trigger_value)  # Modify the copy
+                        logger.debug(
+                            f"Successfully converted 'trigger' value '{trigger_value}' to Enum: {metadata_copy['trigger']}")
+                    except ValueError as ve:
+                        logger.error(f"Invalid value for 'trigger' in metadata: '{trigger_value}'. Error: {ve}")
+                        raise ValueError(f"Invalid trigger value in metadata: {trigger_value}") from ve
+
+                # Ensure all required fields for SnapshotMetadata are present or handled
+                local_snapshot_metadata = SnapshotMetadata(**metadata_copy)  # Use the modified copy
+                logger.info(f"Successfully deserialized metadata for snapshot '{snapshot_id}'.")
+                metadata_loaded_successfully = True
+
+            except (TypeError, ValueError) as deser_err:
+                logger.error(f"Failed to create SnapshotMetadata object from loaded dictionary: {deser_err}",
+                             exc_info=True)
+                logger.debug(f"Metadata dictionary causing failure: {metadata_dict}")  # Log original dict
+                raise  # Re-raise to trigger cleanup
+
+            # --- Update Local Snapshot Index ---
+            # Use snapshot lock to safely modify the in-memory index and file
+            with self._snapshot_lock:
+                logger.debug(f"Acquired snapshot lock. Updating local index for snapshot '{snapshot_id}'.")
+                self._snapshots[snapshot_id] = local_snapshot_metadata
+                try:
+                    self._update_snapshot_index()  # Write updated index to disk
+                    logger.info(f"Successfully updated and saved local snapshot index including '{snapshot_id}'.")
+                except Exception as index_err:
+                    logger.error(f"Failed to save updated snapshot index file: {index_err}", exc_info=True)
+                    # Depending on severity, might want to raise or just log
+                    raise RuntimeError("Failed to save snapshot index after adding remote snapshot") from index_err
+
+        except Exception as prep_err:
+            logger.error(f"Failed during local preparation of remote snapshot '{snapshot_id}': {prep_err}",
+                         exc_info=True)
+            # Attempt cleanup of potentially incomplete local snapshot directory
+            if local_snapshot_dir and local_snapshot_dir.exists():
+                logger.warning(f"Attempting cleanup of incomplete local snapshot directory: {local_snapshot_dir}")
+                shutil.rmtree(local_snapshot_dir, ignore_errors=True)
+            # Ensure snapshot is removed from in-memory index if it was partially added before error
+            if snapshot_id in self._snapshots:
+                with self._snapshot_lock:
+                    if snapshot_id in self._snapshots:  # Double check inside lock
+                        del self._snapshots[snapshot_id]
+                        logger.debug(f"Removed '{snapshot_id}' from in-memory index due to preparation error.")
+            return False  # Indicate failure of the preparation stage
+
+        # --- Trigger Standard Recovery Process ---
+        if metadata_loaded_successfully and snapshot_id:
+            logger.info(f"Local preparation complete. Initiating standard recovery using snapshot '{snapshot_id}'.")
+            try:
+                # Now call the main recovery function using the locally available and indexed snapshot
+                recovery_success = self.recover_from_snapshot(
                     snapshot_id=snapshot_id,
-                    verify_after_recovery=True,
-                    metadata={"source_region": region_id}
+                    verify_after_recovery=True,  # Default or configurable
+                    metadata={"source_region": region_id}  # Pass context
                 )
-                
-            except Exception as e:
-                logger.error(f"Failed to recover from region {region_id}: {e}", exc_info=True)
+                logger.info(
+                    f"Standard recovery process for '{snapshot_id}' completed with result: {recovery_success}")
+                return recovery_success  # Return the result of the actual recovery
+
+            except Exception as recovery_err:
+                # This catches unexpected errors *during the call* to recover_from_snapshot,
+                # though recover_from_snapshot itself should handle its internal errors and return False.
+                logger.error(
+                    f"Unexpected exception occurred while calling recover_from_snapshot for '{snapshot_id}': {recovery_err}",
+                    exc_info=True)
                 return False
-    
+        else:
+            # This case should ideally not be reached if error handling above is correct
+            logger.error(
+                f"Cannot proceed with recovery for '{snapshot_id}' due to earlier preparation failure (metadata_loaded_successfully is False).")
+            return False
+
     def _handle_system_error(self, event: Event):
         """Handle system error event."""
         error_data = event.data
@@ -1936,6 +2142,21 @@ class DisasterRecovery:
                     source="disaster_recovery"
                 ))
 
+
+def _prepare_event_data(data_obj: Any) -> Any:
+    """Recursively convert Enums to values and dataclasses to dicts."""
+    if isinstance(data_obj, dict):
+        return {k: _prepare_event_data(v) for k, v in data_obj.items()}
+    elif isinstance(data_obj, list):
+        return [_prepare_event_data(item) for item in data_obj]
+    elif isinstance(data_obj, Enum):
+        return data_obj.value
+    elif is_dataclass(data_obj):
+        # Convert dataclass to dict first, then process the dict recursively
+        return _prepare_event_data(asdict(data_obj))
+    else:
+        # Return other types as is
+        return data_obj
 
 # Function to get singleton instance
 _disaster_recovery_instance = None

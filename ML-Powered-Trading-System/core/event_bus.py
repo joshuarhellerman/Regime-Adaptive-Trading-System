@@ -492,11 +492,20 @@ class EventBus:
             self._startup_complete.set()
 
             # Notify lifecycle callbacks
-            for callback in self._lifecycle_callbacks["startup"]:
+            self._logger.debug(f"Executing {len(self._lifecycle_callbacks['startup'])} startup callbacks...")
+            for callback_tuple in self._lifecycle_callbacks["startup"]:  # Iterate over tuples
                 try:
-                    callback()
+                    # Unpack the tuple
+                    cb_func, cb_id = callback_tuple
+                    self._logger.debug(f"Executing startup lifecycle callback with ID: {cb_id}")
+                    cb_func()  # Call the actual function (the first element)
+                    self._logger.debug(f"Finished startup lifecycle callback with ID: {cb_id}")
                 except Exception as e:
-                    self._logger.error(f"Error in startup callback: {e}")
+                    # Log the specific callback ID that failed
+                    cb_id_str = callback_tuple[1] if isinstance(callback_tuple, tuple) and len(
+                        callback_tuple) > 1 else "unknown"
+                    self._logger.error(f"Error in startup callback (ID: {cb_id_str}): {e}",
+                                       exc_info=True)  # Log traceback
 
             # Publish the startup event
             self.publish_sync(startup_event)
@@ -523,11 +532,19 @@ class EventBus:
             self.publish_sync(shutdown_event)
 
             # Notify lifecycle callbacks
-            for callback in self._lifecycle_callbacks["shutdown"]:
+            self._logger.debug(f"Executing {len(self._lifecycle_callbacks['shutdown'])} shutdown callbacks...")
+            for callback_tuple in self._lifecycle_callbacks["shutdown"]:  # Iterate over tuples
                 try:
-                    callback()
+                    # Unpack the tuple
+                    cb_func, cb_id = callback_tuple
+                    self._logger.debug(f"Executing shutdown lifecycle callback with ID: {cb_id}")
+                    cb_func()  # Call the actual function (the first element)
+                    self._logger.debug(f"Finished shutdown lifecycle callback with ID: {cb_id}")
                 except Exception as e:
-                    self._logger.error(f"Error in shutdown callback: {e}")
+                    cb_id_str = callback_tuple[1] if isinstance(callback_tuple, tuple) and len(
+                        callback_tuple) > 1 else "unknown"
+                    self._logger.error(f"Error in shutdown callback (ID: {cb_id_str}): {e}",
+                                       exc_info=True)  # Log traceback
 
             # Add sentinel events to unblock threads
             for priority in EventPriority:
