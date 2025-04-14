@@ -123,19 +123,52 @@ The system follows quantitative development best practices:
 
 ## License
 
-This project is licensed under the Creative Commons Attribution-NonCommercial-ShareAlike (CC BY-NC-SA) License - which means:
+### Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International
 
-- **Attribution**: You must give appropriate credit, provide a link to the license, and indicate if changes were made.
-- **NonCommercial**: You may not use the material for commercial purposes.
-- **ShareAlike**: If you remix, transform, or build upon the material, you must distribute your contributions under the same license as the original.
+Copyright (c) 2025 Joshua R. Hellerman
 
-This ensures that the ideas and implementation can be shared for educational purposes while preventing commercial exploitation without permission.
+This project is licensed under the [Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International License](https://creativecommons.org/licenses/by-nc-sa/4.0/).
+
+#### What this license means:
+
+- **Attribution Required**: Anyone using this code or its derivatives must give appropriate credit to the original author, provide a link to the license, and indicate if changes were made.
+- **Non-Commercial Use Only**: This code and any derivatives **may not be used for commercial purposes** without explicit written permission from the author.
+- **Share-Alike Required**: If you remix, transform, or build upon this material, you must distribute your contributions under the same license as the original.
+- **No Additional Restrictions**: You may not apply legal terms or technological measures that legally restrict others from doing anything the license permits.
+
+#### Specifically prohibited without written permission:
+- Using this system or its components in production trading environments
+- Incorporating this code into commercial products or services
+- Licensing or selling access to this system or derivative works
+- Using this system to manage real money or assets for profit
+
+#### Permitted uses:
+- Academic research and educational purposes
+- Personal learning and experimentation
+- Non-commercial testing and development
+
+**For commercial licensing inquiries, please contact:** [joshuahellerman@gmail.com]
+
+## Copyright Notice
+
+All source files in this repository contain the following copyright notice:
+
+```
+/*
+ * Copyright (c) 2025 Joshua R. Hellerman
+ * This code is subject to the terms of the CC BY-NC-SA 4.0 license.
+ * Commercial use is prohibited without explicit written permission.
+ */
+```
 
 ## Contribution
 
-Contributions are welcome for research and educational purposes. Please read the contributing guidelines before submitting pull requests.
+Contributions are welcome for research and educational purposes. By submitting a contribution, you agree:
+1. Your contributions will be licensed under the same CC BY-NC-SA 4.0 license
+2. You have the right to license your contribution under these terms
+3. You understand and accept the non-commercial nature of this project
 
 ## Acknowledgments
 
 - This system architecture is inspired by institutional-grade quantitative trading systems
-- Special thanks to the open-source financial and machine learning communities
+- Special thanks to the open-source financial and machine learning communitiesF{
