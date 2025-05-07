@@ -4,14 +4,19 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 import os
+import sys
 import json
 from pathlib import Path
 
-# Import the module under test
-from risk_manager import RiskManager, RiskLevel, DirectionalBias, VolatilityRegime
+# Add the project root directory to Python's path
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../../../')))
+
+# Import the module under test - FIXED: importing from core.risk_manager instead of risk_manager
+from core.risk_manager import RiskManager, RiskLevel, DirectionalBias, VolatilityRegime
+
 
 class TestRiskManager(unittest.TestCase):
-    
+
     def setUp(self):
         """Set up test fixtures before each test method"""
         # Create a test configuration
@@ -32,12 +37,13 @@ class TestRiskManager(unittest.TestCase):
             'use_dynamic_risk': True,
             'reports_dir': 'test_reports'
         }
-        
+
         # Create risk manager with test config
         self.risk_manager = RiskManager(self.test_config)
-        
+
         # Mock Path.mkdir for reports directory creation
-        patcher = patch('risk_manager.Path.mkdir')
+        # Update this line to use the correct module path
+        patcher = patch('core.risk_manager.Path.mkdir')
         self.addCleanup(patcher.stop)
         self.mock_mkdir = patcher.start()
 
@@ -630,15 +636,24 @@ class TestRiskManager(unittest.TestCase):
     def test_validate_trade(self):
         """Test trade validation"""
         equity = 10000
-        
+
         # Valid trade
         is_valid, reason = self.risk_manager.validate_trade(
             symbol="EUR/USD",
             side="buy",
             size=1000,
             price=1.2,
-            equity=equity
+            equity=equity,
+            # Important: Add these parameters or provide default values in the method
+            regime_info=None,
+            existing_positions=None,
+            price_data=None
         )
+
+        # Debug output to see why it's failing
+        if not is_valid:
+            print(f"Trade validation failed with reason: {reason}")
+
         self.assertTrue(is_valid)
         self.assertEqual(reason, "")
         

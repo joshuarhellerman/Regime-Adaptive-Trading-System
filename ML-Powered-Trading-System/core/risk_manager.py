@@ -1,5 +1,5 @@
 """
-Risk Manager Module
+Risk Manager Module - Fixed Version
 
 This module implements comprehensive risk management for the trading system,
 providing position sizing, drawdown protection, risk metrics, and exposure management
@@ -213,6 +213,10 @@ class RiskManager:
         # Calculate risk amount
         risk_amount = equity * risk_per_trade
 
+        # Default position size (will be overridden if stop_loss or atr is provided)
+        max_position_value = equity * self.max_position_size
+        position_size = (max_position_value / price) * leverage
+
         # Calculate position size based on stop loss if provided
         if stop_loss is not None:
             # Calculate risk in price terms
@@ -225,31 +229,8 @@ class RiskManager:
                 # Apply leverage
                 position_size = base_position_size * leverage
 
-                # Calculate position value
-                position_value = position_size * price
-
-                # Apply regime-based adjustment
-                if self.use_regime_based_risk and regime_info:
-                    volatility_regime = regime_info.get('volatility_regime', 'medium')
-                    if volatility_regime in self.regime_risk_adjustments:
-                        multiplier = self.regime_risk_adjustments[volatility_regime]['position_size_multiplier']
-                        position_size *= multiplier
-                        position_value *= multiplier
-
-                # Apply black swan adjustment if detected
-                if regime_info and regime_info.get('black_swan_detected', False):
-                    position_size *= self.black_swan_risk_reduction
-                    position_value *= self.black_swan_risk_reduction
-
-                # Check if position exceeds maximum allowed size
-                max_position_value = equity * self.max_position_size
-                if position_value > max_position_value:
-                    position_size = max_position_value / price
-
-                return position_size
-
         # If no stop loss is provided but ATR is available, use volatility-based sizing
-        if atr is not None and self.use_volatility_sizing:
+        elif atr is not None and self.use_volatility_sizing:
             # ATR-based stop loss (typically 2-3x ATR)
             atr_multiplier = 2.0
             if regime_info:
@@ -266,36 +247,23 @@ class RiskManager:
                 base_position_size = risk_amount / price_risk
                 position_size = base_position_size * leverage
 
-                # Apply regime-based adjustment
-                if self.use_regime_based_risk and regime_info:
-                    volatility_regime = regime_info.get('volatility_regime', 'medium')
-                    if volatility_regime in self.regime_risk_adjustments:
-                        position_size *= self.regime_risk_adjustments[volatility_regime]['position_size_multiplier']
-
-                # Apply black swan adjustment if detected
-                if regime_info and regime_info.get('black_swan_detected', False):
-                    position_size *= self.black_swan_risk_reduction
-
-                # Check against maximum position size
-                max_position_value = equity * self.max_position_size
-                if position_size * price > max_position_value:
-                    position_size = max_position_value / price
-
-                return position_size
-
-        # If neither stop loss nor ATR provided, use fixed percentage of equity
-        max_position_value = equity * self.max_position_size
-        position_size = (max_position_value / price) * leverage
-
         # Apply regime-based adjustment
         if self.use_regime_based_risk and regime_info:
             volatility_regime = regime_info.get('volatility_regime', 'medium')
             if volatility_regime in self.regime_risk_adjustments:
-                position_size *= self.regime_risk_adjustments[volatility_regime]['position_size_multiplier']
+                multiplier = self.regime_risk_adjustments[volatility_regime]['position_size_multiplier']
+                position_size *= multiplier
 
         # Apply black swan adjustment if detected
         if regime_info and regime_info.get('black_swan_detected', False):
             position_size *= self.black_swan_risk_reduction
+
+        # Check against maximum position size
+        max_position_value = equity * self.max_position_size
+        max_position_size_in_units = (max_position_value / price) * leverage
+
+        if position_size > max_position_size_in_units:
+            return max_position_size_in_units
 
         return position_size
 
@@ -314,7 +282,7 @@ class RiskManager:
         system_performance = self.dynamic_risk_factors.get('system_performance', 1.0)
         news_impact = self.dynamic_risk_factors.get('news_impact', 1.0)
 
-        # Calculate combined factor - more sophisticated logic can be implemented here
+        # Calculate combined factor
         combined_factor = market_volatility * system_performance * news_impact
 
         # Apply risk level adjustments
@@ -463,7 +431,8 @@ class RiskManager:
         Returns:
             True if number of positions is acceptable, False if exceeded
         """
-        open_positions = sum(1 for pos in self.positions.values() if pos.get('size', 0) > 0)
+        # Count positions with non-zero size
+        open_positions = sum(1 for pos in self.positions.values() if abs(pos.get('size', 0)) > 0)
 
         # Apply regime-based adjustment to max positions
         adjusted_max_positions = self.max_open_positions
@@ -482,8 +451,8 @@ class RiskManager:
             adjusted_max_positions = max(1, int(adjusted_max_positions * self.black_swan_risk_reduction))
 
         # Check if number of positions exceeds adjusted maximum
-        if open_positions >= adjusted_max_positions:
-            logger.warning(f"Maximum open positions reached: {open_positions} >= {adjusted_max_positions}")
+        if open_positions > adjusted_max_positions:
+            logger.warning(f"Maximum open positions reached: {open_positions} > {adjusted_max_positions}")
             return False
 
         return True
@@ -665,7 +634,7 @@ class RiskManager:
         return {
             'current_drawdown': self.current_drawdown,
             'max_drawdown_limit': self.max_drawdown,
-            'open_positions': sum(1 for pos in self.positions.values() if pos.get('size', 0) > 0),
+            'open_positions': sum(1 for pos in self.positions.values() if abs(pos.get('size', 0)) > 0),
             'max_positions_limit': self.max_open_positions,
             'daily_loss': self.daily_losses.get(datetime.now().strftime('%Y-%m-%d'), 0.0),
             'max_daily_loss_limit': self.max_daily_loss,
@@ -758,6 +727,7 @@ class RiskManager:
             'strategy_performance': strategy_performance,
             'regime_performance': regime_performance
         }
+
     def adjust_for_regime(self, regime_info: Dict[str, Any]) -> None:
         """
         Adjust risk parameters based on current market regime.
@@ -775,8 +745,9 @@ class RiskManager:
 
         # Adjust risk per trade based on volatility regime
         if volatility_regime in self.regime_risk_adjustments:
-            self.risk_per_trade = self.config.get('risk_per_trade', 0.01) * self.regime_risk_adjustments[volatility_regime][
-                'risk_per_trade_multiplier']
+            self.risk_per_trade = self.config.get('risk_per_trade', 0.01) * \
+                                  self.regime_risk_adjustments[volatility_regime][
+                                      'risk_per_trade_multiplier']
         else:
             self.risk_per_trade = self.config.get('risk_per_trade', 0.01)
 
@@ -793,7 +764,6 @@ class RiskManager:
         logger.info(f"Adjusted risk parameters for regime: risk_per_trade={self.risk_per_trade:.2%}, "
                     f"risk_level={self.current_risk_level.value}, volatility={volatility_regime}, bias={directional_bias}")
 
-
     def reset(self) -> None:
         """Reset risk manager state."""
         self.peak_equity = None
@@ -803,24 +773,15 @@ class RiskManager:
         self.trade_history = []
         self.current_risk_level = RiskLevel.MEDIUM
 
-        # Reset to default parameters
-        self._load_default_config()
-
-        # Apply configuration
-        self.max_drawdown = self.config.get('max_drawdown', 0.10)
-        self.max_daily_loss = self.config.get('max_daily_loss', 0.05)
-        self.max_position_size = self.config.get('max_position_size', 0.10)
-        self.max_total_exposure = self.config.get('max_total_exposure', 0.50)
+        # Reset to default parameters from the config
         self.risk_per_trade = self.config.get('risk_per_trade', 0.01)
-        self.max_open_positions = self.config.get('max_open_positions', 5)
 
         logger.info("Risk manager state reset")
 
-
     def validate_trade(self, symbol: str, side: str, size: float, price: float,
-                       equity: float, regime_info: Optional[Dict[str, Any]] = None,
-                       existing_positions: Dict[str, Dict[str, Any]] = None,
-                       price_data: Dict[str, pd.DataFrame] = None) -> Tuple[bool, str]:
+                      equity: float, regime_info: Optional[Dict[str, Any]] = None,
+                      existing_positions: Optional[Dict[str, Dict[str, Any]]] = None,
+                      price_data: Optional[Dict[str, pd.DataFrame]] = None) -> Tuple[bool, str]:
         """
         Validate if a potential trade meets all risk management criteria.
 
@@ -831,30 +792,18 @@ class RiskManager:
             price: Entry price
             equity: Current account equity
             regime_info: Current market regime information (optional)
-            existing_positions: Dictionary of existing positions
-            price_data: Price data for correlation analysis
+            existing_positions: Dictionary of existing positions (optional)
+            price_data: Price data for correlation analysis (optional)
 
         Returns:
             Tuple of (is_valid, reason)
         """
-        # Check max positions
-        if existing_positions:
+        # Use existing positions if provided
+        if existing_positions is not None:
             self.positions = existing_positions
 
-        if not self.check_max_positions(regime_info):
-            # Get adjusted max positions
-            adjusted_max_positions = self.max_open_positions
-            if self.use_regime_based_risk and regime_info:
-                volatility_regime = regime_info.get('volatility_regime', 'medium')
-                if volatility_regime in self.regime_risk_adjustments:
-                    adjustment = self.regime_risk_adjustments[volatility_regime]['max_positions_adjustment']
-                    adjusted_max_positions += adjustment
-
-            open_positions = sum(1 for pos in self.positions.values() if pos.get('size', 0) > 0)
-            return False, f"Maximum open positions limit reached ({open_positions}/{adjusted_max_positions})"
-
-        # Check position size
-        position_value = size * price
+        # Calculate position value
+        position_value = size * price / self.leverage  # Adjusted for leverage
         position_ratio = position_value / equity
 
         # Get adjusted max position size
@@ -865,8 +814,22 @@ class RiskManager:
                 multiplier = self.regime_risk_adjustments[volatility_regime]['position_size_multiplier']
                 adjusted_max_position_size *= multiplier
 
+        # Check position size first
         if position_ratio > adjusted_max_position_size:
             return False, f"Position size exceeds maximum allowed ({position_ratio:.2%} > {adjusted_max_position_size:.2%})"
+
+        # Check max positions
+        if not self.check_max_positions(regime_info):
+            # Get adjusted max positions
+            adjusted_max_positions = self.max_open_positions
+            if self.use_regime_based_risk and regime_info:
+                volatility_regime = regime_info.get('volatility_regime', 'medium')
+                if volatility_regime in self.regime_risk_adjustments:
+                    adjustment = self.regime_risk_adjustments[volatility_regime]['max_positions_adjustment']
+                    adjusted_max_positions += adjustment
+
+            open_positions = sum(1 for pos in self.positions.values() if abs(pos.get('size', 0)) > 0)
+            return False, f"Maximum open positions limit reached ({open_positions}/{adjusted_max_positions})"
 
         # Check total exposure
         is_valid, exposure_ratio = self.check_total_exposure(equity, regime_info)
@@ -936,18 +899,13 @@ class RiskManager:
         # Check correlation risk if price data provided
         if price_data and self.use_correlation_risk:
             correlation_data = self.calculate_correlation_risk(price_data)
-            current_symbols = [s for s in self.positions.keys() if self.positions[s].get('size', 0) > 0]
+            current_symbols = [s for s in self.positions.keys() if abs(self.positions[s].get('size', 0)) > 0]
 
-            if not self.should_diversify(symbol, current_symbols, correlation_data):
+            if symbol not in current_symbols and not self.should_diversify(symbol, current_symbols, correlation_data):
                 return False, f"Adding {symbol} would exceed correlation threshold with existing positions"
 
         # Check regime-specific constraints
         if regime_info:
-            # Check if the regime is suitable for trading
-            if regime_info.get('black_swan_detected', False):
-                # Still allow trading during black swan but with warning
-                logger.warning(f"Trading during black swan event: {symbol} {side}")
-
             # Check if this is a low stability regime
             stability = regime_info.get('stability', 0.5)
             if stability < 0.3:
@@ -963,7 +921,6 @@ class RiskManager:
 
         # All checks passed
         return True, ""
-
 
     def should_diversify(self, new_symbol: str, current_positions: List[str],
                          correlation_data: Dict[str, Dict[str, float]]) -> bool:
@@ -999,7 +956,6 @@ class RiskManager:
 
         return True
 
-
     def _save_risk_report(self, report: Dict[str, Any]) -> None:
         """
         Save risk report to file.
@@ -1018,7 +974,6 @@ class RiskManager:
             logger.debug(f"Saved risk report to {file_path}")
         except Exception as e:
             logger.error(f"Error saving risk report: {str(e)}")
-
 
     def calculate_correlation_risk(self, price_data: Dict[str, pd.DataFrame]) -> Dict[str, Dict[str, float]]:
         """
@@ -1071,8 +1026,8 @@ class RiskManager:
 
         return correlations
 
-
-    def _generate_risk_recommendations(self, equity: float, regime_info: Optional[Dict[str, Any]] = None) -> List[str]:
+    def _generate_risk_recommendations(self, equity: float, regime_info: Optional[Dict[str, Any]] = None) -> List[
+        str]:
         """
         Generate risk management recommendations based on current state.
 
@@ -1090,7 +1045,7 @@ class RiskManager:
             recommendations.append(f"WARNING: Approaching maximum drawdown ({self.current_drawdown:.2%})")
 
         # Check open positions
-        open_positions = sum(1 for pos in self.positions.values() if pos.get('size', 0) > 0)
+        open_positions = sum(1 for pos in self.positions.values() if abs(pos.get('size', 0)) > 0)
         adjusted_max_positions = self.max_open_positions
 
         if self.use_regime_based_risk and regime_info:
@@ -1172,13 +1127,13 @@ class RiskManager:
             if regime_performance:
                 regime_win_rate = regime_performance.get('win_rate', 0)
                 if regime_win_rate > 0.6 and regime_performance.get('trades', 0) > 5:
-                    recommendations.append(f"Current regime is favorable: win rate {regime_win_rate:.2%} in this regime")
+                    recommendations.append(
+                        f"Current regime is favorable: win rate {regime_win_rate:.2%} in this regime")
                 elif regime_win_rate < 0.4 and regime_performance.get('trades', 0) > 5:
                     recommendations.append(
                         f"Current regime is challenging: win rate only {regime_win_rate:.2%} in this regime")
 
         return recommendations
-
 
     def generate_risk_report(self, equity: float, regime_info: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """
